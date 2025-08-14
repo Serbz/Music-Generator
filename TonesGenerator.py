@@ -244,14 +244,14 @@ class HarmonizerApp:
             self.update_log(f"Error saving settings: {e}", 'main')
 
     def _load_settings(self):
-        try:
-            if os.path.exists(self.SETTINGS_FILE):
-                with open(self.SETTINGS_FILE, 'r') as f:
-                    settings = json.load(f)
-            else:
-                settings = {} # Use defaults if file doesn't exist
+        if self.ui_mode:
+            try:
+                if os.path.exists(self.SETTINGS_FILE):
+                    with open(self.SETTINGS_FILE, 'r') as f:
+                        settings = json.load(f)
+                else:
+                    settings = {} # Use defaults if file doesn't exist
 
-            if self.ui_mode:
                 self.entry_duration.delete(0, tk.END)
                 self.entry_duration.insert(0, settings.get("duration", "30"))
                 self.bit_depth_var.set(settings.get("bit_depth", "16"))
@@ -263,27 +263,26 @@ class HarmonizerApp:
                 self.force_var.set(settings.get("force", False))
                 self.melody_volume_slider.set(settings.get("harmonic_vol", 70.0))
                 self.drum_volume_slider.set(settings.get("drum_vol", 70.0))
-            else:
-                self.settings = {
-                    "duration": settings.get("duration", "90"),
-                    "bit_depth": settings.get("bit_depth", "16"),
-                    "waveform": settings.get("waveform", "Sine"),
-                    "polyphonic": settings.get("polyphonic", True),
-                    "polyrhythmic": settings.get("polyrhythmic", True),
-                    "polytonal": settings.get("polytonal", True),
-                    "force": settings.get("force", False)
-                }
-            
-            loaded_scales = settings.get("scales", {})
-            if self.ui_mode:
+                
+                loaded_scales = settings.get("scales", {})
                 for st, var in self.scale_vars.items():
                     var.set(loaded_scales.get(st, True))
-            else:
-                self.scale_vars = {st: loaded_scales.get(st, True) for st in self.scale_types}
-                self.settings["scales"] = self.scale_vars
 
-        except Exception as e:
-            self.update_log(f"Error loading settings: {e}", 'main')
+            except Exception as e:
+                self.update_log(f"Error loading settings: {e}", 'main')
+        else:
+            # For no-ui mode, ignore the settings file and use hardcoded defaults.
+            self.settings = {
+                "duration": "90",
+                "bit_depth": "16",
+                "waveform": "Piano",
+                "polyphonic": True,
+                "polyrhythmic": True,
+                "polytonal": True,
+                "force": False
+            }
+            self.scale_vars = {st: True for st in self.scale_types}
+            self.settings["scales"] = self.scale_vars
 
     def _open_scales_window(self):
         scales_win = tk.Toplevel(self.master)
