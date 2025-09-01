@@ -146,6 +146,8 @@ class HarmonizerApp:
             'Iambic': [0.5, 1.0], 'Trochaic': [1.0, 0.5], 'Anapestic': [0.5, 0.5, 1.0],
             'Dactylic': [1.0, 0.5, 0.5], 'Spondaic': [1.0, 1.0], 'Pyrrhic': [0.5, 0.5]
         }
+        
+        self.form_types = ["Standard", "Ternary", "Rondo", "Sonata", "AABA"]
 
         self.MUSICAL_SCALES = {}
         for note, base_freq in self.NOTE_FREQUENCIES.items():
@@ -239,6 +241,7 @@ class HarmonizerApp:
 
 
         if self.ui_mode:
+            self.form_vars = {ft: BooleanVar(value=(ft == "Standard")) for ft in self.form_types}
             self._setup_ui()
         else:
             self.settings = {}
@@ -257,6 +260,10 @@ class HarmonizerApp:
 
     def _setup_ui(self):
         style = ttk.Style(); style.theme_use('clam'); style.configure("TScale", background="#2e2e2e", troughcolor="#444444")
+        style.configure('TRadiobutton', background='#2e2e2e', foreground='white', indicatorrelief=tk.FLAT)
+        style.map('TRadiobutton',
+            background=[('active', '#3e3e3e')],
+            indicatorcolor=[('selected', '#4dbce9'), ('!selected', 'gray')])
         frame = tk.Frame(self.master, padx=10, pady=10, bg='#2e2e2e'); frame.pack(fill=tk.BOTH, expand=True)
         
         # Top Controls
@@ -266,13 +273,7 @@ class HarmonizerApp:
         self.stop_button = tk.Button(top_frame, text="Stop", command=self.stop_music, bg='#555555', fg='white', state=tk.DISABLED); self.stop_button.pack(side=tk.LEFT, padx=5)
         self.loop_var = BooleanVar(); self.loop_check = tk.Checkbutton(top_frame, text="Loop", variable=self.loop_var, bg='#2e2e2e', fg='white', selectcolor='#444444', command=self._save_settings); self.loop_check.pack(side=tk.LEFT, padx=10)
         self.scales_button = tk.Button(top_frame, text="Scales", command=self._open_scales_window, bg='#4d6b88', fg='white'); self.scales_button.pack(side=tk.LEFT, padx=5)
-        
-        tk.Label(top_frame, text="Form:", bg='#2e2e2e', fg='white').pack(side=tk.LEFT, padx=(20, 5))
-        self.form_var = tk.StringVar(self.master)
-        self.form_var.set("Standard")
-        forms = ["Standard", "Ternary", "Rondo", "Sonata", "AABA"]
-        self.form_menu = tk.OptionMenu(top_frame, self.form_var, *forms, command=self._save_settings)
-        self.form_menu.pack(side=tk.LEFT, padx=5)
+        self.form_button = tk.Button(top_frame, text="Form", command=self._open_form_window, bg='#4d6b88', fg='white'); self.form_button.pack(side=tk.LEFT, padx=5)
 
         tk.Label(top_frame, text="Duration (s):", bg='#2e2e2e', fg='white').pack(side=tk.LEFT, padx=(20, 5))
         self.entry_duration = tk.Entry(top_frame, bg='#444444', fg='white', width=10); self.entry_duration.pack(side=tk.LEFT, padx=5)
@@ -372,7 +373,8 @@ class HarmonizerApp:
             "duration": self.entry_duration.get(), "bit_depth": self.bit_depth_var.get(), "auto_wave": self.auto_wave_var.get(),
             "m1_waveform": self.melody1_waveform_var.get(), "m2_waveform": self.melody2_waveform_var.get(),
             "chord_waveform": self.chord_waveform_var.get(), "bass_waveform": self.bass_waveform_var.get(),
-            "loop": self.loop_var.get(), "form": self.form_var.get(),
+            "loop": self.loop_var.get(), 
+            "forms": {ft: var.get() for ft, var in self.form_vars.items()},
             "melody_vol": self.melody_volume_slider.get(), "harmony_vol": self.harmony_volume_slider.get(), "drum_vol": self.drum_volume_slider.get(),
             "scales": {st: var.get() for st, var in self.scale_vars.items()},
             # --- NEW: Save new UI settings ---
@@ -397,9 +399,14 @@ class HarmonizerApp:
                 self.bit_depth_var.set(settings.get("bit_depth", "24")); self.auto_wave_var.set(settings.get("auto_wave", True))
                 self.melody1_waveform_var.set(settings.get("m1_waveform", "Piano")); self.melody2_waveform_var.set(settings.get("m2_waveform", "Sine"))
                 self.chord_waveform_var.set(settings.get("chord_waveform", "Synth Pad")); self.bass_waveform_var.set(settings.get("bass_waveform", "Square"))
-                self.loop_var.set(settings.get("loop", False)); self.form_var.set(settings.get("form", "Standard"))
+                self.loop_var.set(settings.get("loop", False))
+                
+                loaded_forms = settings.get("forms", {})
+                for ft, var in self.form_vars.items():
+                    var.set(loaded_forms.get(ft, (ft == "Standard")))
+
                 self.melody_volume_slider.set(settings.get("melody_vol", 70.0)); self.harmony_volume_slider.set(settings.get("harmony_vol", 70.0)); self.drum_volume_slider.set(settings.get("drum_vol", 70.0))
-                # --- NEW: Load new UI settings ---
+                
                 self.tension_slider.set(settings.get("tension", 50.0))
                 self.dynamics_slider.set(settings.get("dynamics", 30.0))
                 self.m1_pan_slider.set(settings.get("m1_pan", -20.0))
@@ -451,7 +458,7 @@ class HarmonizerApp:
             ("Loop:", 'param'), (" If checked, a new song will automatically generate and play after the current one finishes.\n\n", ''),
 
             ("Musical Parameters\n", 'heading'),
-            ("Form:", 'param'), (" Sets the overall structure of the song (e.g., Verse-Chorus, Sonata, etc.).\n", ''),
+            ("Form:", 'param'), (" Opens a window to enable or disable song structures. The generator will randomly pick from the enabled options.\n", ''),
             ("Duration (s):", 'param'), (" The total length of the generated piece in seconds.\n", ''),
             ("Scales:", 'param'), (" Opens a window to enable or disable specific musical scales that the generator can choose from.\n\n", ''),
 
@@ -487,6 +494,20 @@ class HarmonizerApp:
             row = i % ( (num_scales + 1) // num_cols ); col = i // ( (num_scales + 1) // num_cols )
             cb = tk.Checkbutton(main_frame, text=scale_type, variable=var, bg='#2e2e2e', fg='white', selectcolor='#444444', command=self._save_settings)
             cb.grid(row=row, column=col, sticky='w', padx=5, pady=2)
+
+    def _open_form_window(self):
+        form_win = tk.Toplevel(self.master)
+        form_win.title("Enabled Forms")
+        form_win.configure(bg='#2e2e2e')
+        main_frame = tk.Frame(form_win, padx=10, pady=10, bg='#2e2e2e')
+        main_frame.pack()
+
+        tk.Label(main_frame, text="Select desired song structures:", bg='#2e2e2e', fg='white').pack(anchor='w', pady=(0, 5))
+
+        for form_type in self.form_types:
+            var = self.form_vars[form_type]
+            cb = tk.Checkbutton(main_frame, text=form_type, variable=var, bg='#2e2e2e', fg='white', selectcolor='#444444', command=self._save_settings)
+            cb.pack(anchor='w', padx=5, pady=2)
 
     def open_debug_window(self):
         if self.debug_window is None or not self.debug_window.winfo_exists():
@@ -1712,18 +1733,31 @@ class HarmonizerApp:
         melody_bpm += (global_tension - 0.5) * 40 # Tension affects tempo
         
         beat_duration, log_callback = 60.0 / melody_bpm, self.update_log
-        user_enabled_scales = [st for st, var in self.scale_vars.items() if var.get()] or ["Major"]
+        
+        user_enabled_scales = [st for st, var in self.scale_vars.items() if var.get()]
+        if not user_enabled_scales:
+            self.update_log("No scales selected, choosing from all available scales.", 'main')
+            user_enabled_scales = self.scale_types
+
         final_scale_choices = [s for s in user_enabled_scales if s in affect_scale_choices] or user_enabled_scales
         possible_scales = [name for name in self.MUSICAL_SCALES.keys() if name.split(' ', 1)[1] in final_scale_choices]
         selected_scale_name = random.choice(possible_scales) if possible_scales else "C Major"
+        
         if self.ui_mode and self.auto_wave_var.get(): self._intelligently_select_waveforms(song_affect)
+        
         texture_type = random.choices(['homophonic', 'polyphonic', 'heterophonic'], weights=[3, 3, 3])[0]
         is_polyphonic, is_heterophonic = (texture_type == 'polyphonic'), (texture_type == 'heterophonic')
         is_polyrhythmic, is_polytonal = (texture_type != 'homophonic') and random.random() < 0.5, (texture_type != 'homophonic') and random.random() < 0.4
         log_callback(f"Generating {total_duration}s of music...", 'main')
         log_callback(f"Affect: {song_affect}, Texture: {texture_type.capitalize()}, Polyrhythmic: {is_polyrhythmic}, Polytonal: {is_polytonal}", 'main')
         self.current_m1_waveform, self.current_m2_waveform, self.current_chord_waveform, self.current_bass_waveform = self._get_waveform(self.melody1_waveform_var), self._get_waveform(self.melody2_waveform_var), self._get_waveform(self.chord_waveform_var), self._get_waveform(self.bass_waveform_var)
-        song_form = self.form_var.get() if self.ui_mode else self.settings.get("form", "Standard")
+        
+        user_enabled_forms = [ft for ft, var in self.form_vars.items() if var.get()]
+        if not user_enabled_forms:
+            self.update_log("No forms selected, choosing from all available forms.", 'main')
+            user_enabled_forms = self.form_types
+        song_form = random.choice(user_enabled_forms)
+
         drum_style = random.choice(list(self.DRUM_PATTERNS.keys()))
         log_callback(f"Key: {selected_scale_name}, Tempo: {melody_bpm:.0f} BPM, Form: {song_form}, Style: {drum_style}", 'main')
         
@@ -2195,4 +2229,3 @@ if __name__ == "__main__":
         root = tk.Tk()
         app = HarmonizerApp(root)
         root.mainloop()
-
