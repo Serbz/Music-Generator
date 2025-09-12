@@ -1,9 +1,31 @@
-# First, you'll need to install the following libraries:
-# pip install pygame
-# pip install scipy
-# pip install midiutil
-# pip install matplotlib
+# --- Automatic Library Installation ---
+import subprocess
+import sys
 
+def install_package(package_name, import_name=None):
+    """Tries to import a package, installing it if it fails."""
+    if import_name is None:
+        import_name = package_name
+    try:
+        __import__(import_name)
+        print(f"'{import_name}' is already installed.")
+    except ImportError:
+        print(f"Library '{import_name}' not found. Attempting to install '{package_name}'...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package_name])
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: Failed to install '{package_name}'. Please install it manually.")
+            print(f"Error details: {e}")
+            sys.exit(1)
+
+# Install required packages
+install_package('pygame')
+install_package('scipy')
+install_package('midiutil')
+install_package('matplotlib')
+install_package('numpy') # Although a dependency, explicit check is good practice
+
+# --- Main Imports ---
 import numpy as np
 import pygame
 import time
@@ -14,12 +36,75 @@ import threading
 from scipy import signal
 import wave
 import os
-import sys
 from midiutil import MIDIFile
 import math
 import traceback
 import copy
 import json
+
+class SpeciesCounterpointEngine:
+    """
+    A class to handle the rules of species counterpoint for generating a second melody.
+    """
+    def __init__(self, primary_melody, scale_notes, base_scale_len):
+        self.primary_melody = sorted(primary_melody, key=lambda x: x['start_time'])
+        self.scale_notes = scale_notes
+        self.base_scale_len = base_scale_len
+        self.consonant_intervals = {0, 3, 4, 7, 8, 9}  # Unison, thirds, fourths, fifths, sixths (in semitones)
+
+    def _get_interval(self, idx1, idx2):
+        # This is a simplification; a full implementation would need the scale's interval map.
+        major_intervals = [0, 2, 4, 5, 7, 9, 11]
+        semitone1 = major_intervals[idx1 % 7]
+        semitone2 = major_intervals[idx2 % 7]
+        return abs(semitone1 - semitone2) % 12
+
+    def _is_consonant(self, idx1, idx2):
+        return self._get_interval(idx1, idx2) in self.consonant_intervals
+
+    def _avoids_parallels(self, last_m1, last_m2, current_m1, current_m2):
+        if last_m1 is None or last_m2 is None:
+            return True
+        interval1 = self._get_interval(last_m1, last_m2)
+        interval2 = self._get_interval(current_m1, current_m2)
+        if interval1 == interval2 and interval1 in {0, 7}:  # Parallel unisons/octaves and fifths
+            return False
+        return True
+
+    def generate_first_species(self, start_idx, m2_waveform, m2_vol_mult):
+        events = []
+        last_m1_idx, last_m2_idx = None, None
+        for event in self.primary_melody:
+            if not event.get('scale_idx'): continue
+            m1_idx = event['scale_idx'][0]
+            
+            possible_notes = []
+            direction = -1 if m1_idx > start_idx else 1
+            for i in range(1, self.base_scale_len):
+                candidate_idx = start_idx + (i * direction)
+                if self._is_consonant(m1_idx, candidate_idx) and self._avoids_parallels(last_m1_idx, last_m2_idx, m1_idx, candidate_idx):
+                    possible_notes.append(candidate_idx)
+                
+            if not possible_notes: # Fallback
+                candidate_idx = start_idx + random.choice([-2, -1, 1, 2])
+            else:
+                candidate_idx = random.choice(possible_notes)
+
+            m2_idx = max(0, min(len(self.scale_notes) - 1, candidate_idx))
+            
+            new_event = copy.deepcopy(event)
+            new_event.update({
+                'scale_idx': [m2_idx],
+                'freqs': [self.scale_notes[m2_idx]],
+                'waveform': m2_waveform,
+                'volume': event['volume'] * m2_vol_mult
+            })
+            events.append(new_event)
+            
+            last_m1_idx, last_m2_idx = m1_idx, m2_idx
+            start_idx = m2_idx
+
+        return events
 
 class HarmonizerApp:
     def __init__(self, master, ui_mode=True):
@@ -53,7 +138,6 @@ class HarmonizerApp:
         self.debug_window = None
         self.debug_log_area = None
         
-        # --- NEW: Parameters for note resonance ---
         self.RESONANT_WAVEFORMS = {'Piano', 'Guitar', 'Violin', 'Cello'}
         self.MIN_RESONANT_DURATION = 0.25 # in seconds
 
@@ -126,6 +210,23 @@ class HarmonizerApp:
             'Major': {'ii': 'ii°', 'iii': 'III+', 'IV': 'iv', 'vi': 'bVI'},
             'Minor': {'iv': 'IV', 'v': 'V', 'VII': 'vii°'}
         }
+        
+        self.L_SYSTEM_RULES = {
+            'A': [{'rule': 'AB', 'weight': 0.6}, {'rule': 'A-B', 'weight': 0.4}],
+            'B': [{'rule': 'A', 'weight': 1.0}],
+            'transformations': {
+                '+': lambda note: {'interval': note['interval'] + 2, 'duration': note['duration']},
+                '-': lambda note: {'interval': note['interval'] - 2, 'duration': note['duration']},
+                'inv': lambda note: {'interval': -note['interval'], 'duration': note['duration']},
+                'aug': lambda note: {'interval': note['interval'], 'duration': note['duration'] * 1.5},
+                'dim': lambda note: {'interval': note['interval'], 'duration': note['duration'] / 1.5},
+            }
+        }
+        
+        self.AFFECT_PITCH_SETS = {
+            'atonal': {'source_sets': [[0,1,4], [0,1,6], [0,2,6]]}
+        }
+
 
         self.SECONDARY_DOMINANTS = {
             'Major': {'V/ii': 1, 'V/iii': 2, 'V/IV': 3, 'V/V': 4, 'V/vi': 5},
@@ -147,7 +248,7 @@ class HarmonizerApp:
             'Dactylic': [1.0, 0.5, 0.5], 'Spondaic': [1.0, 1.0], 'Pyrrhic': [0.5, 0.5]
         }
         
-        self.form_types = ["Standard", "Ternary", "Rondo", "Sonata", "AABA"]
+        self.form_types = ["Standard", "Ternary", "Rondo", "Sonata", "AABA", "Theme and Variations"]
 
         self.MUSICAL_SCALES = {}
         for note, base_freq in self.NOTE_FREQUENCIES.items():
@@ -208,7 +309,6 @@ class HarmonizerApp:
             }
         }
         
-        # --- NEW: MIDI Program Names and Numbers ---
         self.MIDI_INSTRUMENTS = {
             "Acoustic Grand Piano": 0, "Bright Acoustic Piano": 1, "Electric Grand Piano": 2, "Honky-tonk Piano": 3,
             "Electric Piano 1": 4, "Electric Piano 2": 5, "Harpsichord": 6, "Clavinet": 7, "Celesta": 8, "Glockenspiel": 9,
@@ -377,7 +477,6 @@ class HarmonizerApp:
             "forms": {ft: var.get() for ft, var in self.form_vars.items()},
             "melody_vol": self.melody_volume_slider.get(), "harmony_vol": self.harmony_volume_slider.get(), "drum_vol": self.drum_volume_slider.get(),
             "scales": {st: var.get() for st, var in self.scale_vars.items()},
-            # --- NEW: Save new UI settings ---
             "tension": self.tension_slider.get(), "dynamics": self.dynamics_slider.get(),
             "m1_pan": self.m1_pan_slider.get(), "m2_pan": self.m2_pan_slider.get(),
             "chord_pan": self.chord_pan_slider.get(), "bass_pan": self.bass_pan_slider.get(),
@@ -398,6 +497,7 @@ class HarmonizerApp:
                 self.entry_duration.delete(0, tk.END); self.entry_duration.insert(0, settings.get("duration", "60"))
                 self.bit_depth_var.set(settings.get("bit_depth", "24")); self.auto_wave_var.set(settings.get("auto_wave", True))
                 self.melody1_waveform_var.set(settings.get("m1_waveform", "Piano")); self.melody2_waveform_var.set(settings.get("m2_waveform", "Sine"))
+                self.chord_waveform_var.set(settings.get("m2_waveform", "Violin"))
                 self.chord_waveform_var.set(settings.get("chord_waveform", "Synth Pad")); self.bass_waveform_var.set(settings.get("bass_waveform", "Square"))
                 self.loop_var.set(settings.get("loop", False))
                 
@@ -433,7 +533,6 @@ class HarmonizerApp:
             self.update_log(f"Error loading settings: {e}", 'main')
             self.update_log(traceback.format_exc(), 'debug', debug_only=True)
 
-    # --- NEW: Help Window ---
     def _open_help_window(self):
         help_win = tk.Toplevel(self.master)
         help_win.title("Harmonizer Help")
@@ -450,28 +549,23 @@ class HarmonizerApp:
         help_text = [
             ("Harmonizer Help Guide\n\n", 'title'),
             ("This guide explains the function of each control in the Harmonizer application.\n\n", ''),
-            
             ("Main Controls\n", 'heading'),
             ("Play:", 'param'), (" Generates and plays a new song based on the current settings.\n", ''),
             ("Replay:", 'param'), (" Plays the last generated song again without regenerating.\n", ''),
             ("Stop:", 'param'), (" Stops the current playback or generation process.\n", ''),
             ("Loop:", 'param'), (" If checked, a new song will automatically generate and play after the current one finishes.\n\n", ''),
-
             ("Musical Parameters\n", 'heading'),
             ("Form:", 'param'), (" Opens a window to enable or disable song structures. The generator will randomly pick from the enabled options.\n", ''),
             ("Duration (s):", 'param'), (" The total length of the generated piece in seconds.\n", ''),
             ("Scales:", 'param'), (" Opens a window to enable or disable specific musical scales that the generator can choose from.\n\n", ''),
-
             ("Waveforms\n", 'heading'),
             ("Auto-Select:", 'param'), (" When checked, the application intelligently picks instrument sounds (waveforms) based on the song's generated 'affect' (e.g., uplifting, melancholy).\n", ''),
             ("Melody 1/2, Chords, Bass:", 'param'), (" Manually select the waveform for each musical part. 'Random' will pick a new sound for that part each time you play.\n\n", ''),
-
             ("Mixer & Generation\n", 'heading'),
             ("Volume Sliders:", 'param'), (" Control the loudness of the Melody (1 & 2 combined), Harmony (Chords & Bass combined), and Drums.\n", ''),
             ("Tension:", 'param'), (" Influences the overall energy and complexity of the music. Higher tension leads to faster tempos, more complex rhythms, and more frequent melodic flourishes.\n", ''),
             ("Dynamics:", 'param'), (" Controls the amount of volume variation within musical phrases (crescendos/decrescendos). Higher values create a more expressive, less robotic performance.\n", ''),
             ("Pan Sliders (M1, M2, Chord, Bass):", 'param'), (" Position each instrument in the stereo field. -100 is hard left, 0 is center, and 100 is hard right.\n\n", ''),
-
             ("Export & MIDI\n", 'heading'),
             ("MIDI Instrument Menus:", 'param'), (" Select the General MIDI instrument sound that will be assigned to each part when you export a MIDI file. This does not affect the audio playback in the app.\n", ''),
             ("Export WAV:", 'param'), (" Saves the last generated song as a high-quality stereo WAV audio file.\n", ''),
@@ -545,21 +639,81 @@ class HarmonizerApp:
                     min_dist, closest_name = abs(freq - note_freq_in_octave), f"{note_name}{octave}"
         return closest_name
     
-    def _generate_melodic_note(self, current_note_index, last_note_index, last_last_note_idx, scale_notes, current_chord_indices, last_direction, consecutive_steps, section_type, scale_type, log_callback, contour, phrase_progress, motion_type=None, counter_melody_direction=None, octave_center_idx=None, is_strong_beat=False, force_leap=False, target_note_idx=None, characteristic_note_idx=None):
+    def _generate_urlinie(self, num_events, base_scale_len):
+        """
+        Generates a Schenkerian Urlinie (background line), typically a simple descent.
+        """
+        start_degree = random.choice([2, 4])  # 0-indexed for 3rd, 5th
+        end_degree = 0 # Tonic
+        urlinie_degrees = np.linspace(start_degree, end_degree, num_events).astype(int)
+        urlinie_indices = [d + (base_scale_len * 2) for d in urlinie_degrees]
+        self.update_log(f"Generated Schenkerian Urlinie (background structure): {urlinie_indices}", 'debug', debug_only=True)
+        return urlinie_indices
+
+    def _generate_l_system_melody(self, axiom, generations):
+        """
+        Generates a sequence of melodic transformations using an L-System.
+        """
+        current_string = "A" 
+        for _ in range(generations):
+            next_string = ""
+            for char in current_string:
+                if char in self.L_SYSTEM_RULES:
+                    rules = self.L_SYSTEM_RULES[char]
+                    weights = [r['weight'] for r in rules]
+                    chosen_rule = random.choices(rules, weights=weights, k=1)[0]['rule']
+                    next_string += chosen_rule
+                else:
+                    next_string += char
+            current_string = next_string
+
+        self.update_log(f"L-System generated string: {current_string}", 'debug', debug_only=True)
+        
+        final_melody_sequence = []
+        for char in current_string:
+            transformed_axiom = copy.deepcopy(axiom)
+            if char in self.L_SYSTEM_RULES['transformations']:
+                 transformed_axiom = [self.L_SYSTEM_RULES['transformations'][char](note) for note in transformed_axiom]
+            final_melody_sequence.append(transformed_axiom)
+            
+        return final_melody_sequence
+
+    def _generate_melodic_note(self, current_note_index, last_note_index, last_last_note_idx, scale_notes, current_chord_indices, last_direction, consecutive_steps, section_type, scale_type, log_callback, contour, phrase_progress, motion_type=None, counter_melody_direction=None, octave_center_idx=None, is_strong_beat=False, force_leap=False, target_note_idx=None, characteristic_note_idx=None, pitch_class_set=None):
         log_callback(f"    Melody Note Gen Start: current_idx={current_note_index}, last_idx={last_note_index}, contour={contour}, target_note={target_note_idx}", 'debug', debug_only=True)
-        scale_length = len(scale_notes); base_scale_len = 7 if 'Pentatonic' not in scale_type else 5
+        scale_length = len(scale_notes)
+        base_scale_len = 12 if pitch_class_set is not None else (7 if 'Pentatonic' not in scale_type else 5)
         next_note_index, next_direction, consecutive_steps_new, rule_applied = current_note_index, last_direction, consecutive_steps, "No rule"
         
+        # Atonal logic using Pitch-Class Sets
+        if pitch_class_set is not None:
+            current_pitch_class = self.INTERVAL_NAMES['Major'][current_note_index % 7] % 12
+            possible_moves = []
+            for interval in pitch_class_set:
+                # Transpose the set to the current note
+                transposed_set = [(current_pitch_class + i) % 12 for i in pitch_class_set]
+                for note in transposed_set:
+                    # Find closest scale index to this pitch class
+                    # This is a simplification; a true atonal generator would use all 12 tones.
+                    closest_idx = min(range(len(scale_notes)), key=lambda i: abs(self.INTERVAL_NAMES['Major'][i % 7] - note))
+                    if closest_idx != current_note_index:
+                        possible_moves.append(closest_idx)
+            if possible_moves:
+                next_note_index = random.choice(possible_moves)
+            else: # Fallback
+                next_note_index = current_note_index + random.choice([-2, -1, 1, 2])
+            return max(0, min(scale_length - 1, next_note_index)), np.sign(next_note_index - current_note_index), 0
+
+        # Tonal logic (existing code)
         contour_bias = 0
         if contour == 'rising': contour_bias = 1
         elif contour == 'falling': contour_bias = -1
         elif contour == 'arch': contour_bias = 1 if phrase_progress < 0.5 else -1
         elif contour == 'valley': contour_bias = -1 if phrase_progress < 0.5 else 1
-
-        # --- IMPROVEMENT: Increased probabilities for musically "correct" rules ---
-        if target_note_idx is not None and random.random() < 0.7: # Increased from 0.6
+        
+        if target_note_idx is not None and random.random() < 0.8: # Schenkerian pull is stronger
             direction_to_target = np.sign(target_note_idx - current_note_index)
-            if direction_to_target != 0: next_direction, next_note_index, rule_applied, consecutive_steps_new = direction_to_target, current_note_index + direction_to_target, "Structural Pull", 1
+            if direction_to_target != 0:
+                next_direction, next_note_index, rule_applied, consecutive_steps_new = direction_to_target, current_note_index + direction_to_target, "Schenkerian Pull", 1
         if rule_applied == "No rule" and characteristic_note_idx is not None and random.random() < 0.4:
             octave_multiple = round((current_note_index - characteristic_note_idx) / base_scale_len)
             target_char_note = characteristic_note_idx + (octave_multiple * base_scale_len)
@@ -573,12 +727,12 @@ class HarmonizerApp:
         if rule_applied == "No rule" and is_strong_beat and random.random() < 0.9 and current_chord_indices and len(current_chord_indices) >= 2:
             target_guide_tone = current_chord_indices[1]; octave_multiple = round((current_note_index - target_guide_tone) / base_scale_len)
             next_note_index, rule_applied = target_guide_tone + (octave_multiple * base_scale_len), "Guide Tone (3rd)"
-        if rule_applied == "No rule" and last_note_index is not None and abs(current_note_index - last_note_index) > 4 and random.random() < 0.98: # Increased from 0.95
+        if rule_applied == "No rule" and last_note_index is not None and abs(current_note_index - last_note_index) > 4 and random.random() < 0.98:
             next_direction, next_note_index, consecutive_steps_new, rule_applied = -np.sign(current_note_index - last_note_index), current_note_index - np.sign(current_note_index - last_note_index), 1, "Leap Recovery (Gap Fill)"
         if rule_applied == "No rule" and consecutive_steps >= 4: next_direction, next_note_index, consecutive_steps_new, rule_applied = -last_direction if last_direction != 0 else random.choice([-1, 1]), (current_note_index - last_direction if last_direction != 0 else current_note_index + random.choice([-1, 1])), 1, "Step Sequence Break"
         if rule_applied == "No rule":
             is_chord_tone = (current_note_index % base_scale_len) in [idx % base_scale_len for idx in current_chord_indices]
-            if not is_chord_tone and random.random() < 0.95: # Increased from 0.9
+            if not is_chord_tone and random.random() < 0.95:
                 next_direction, next_note_index, consecutive_steps_new, rule_applied = random.choice([-1, 1]), current_note_index + random.choice([-1, 1]), 1, "Non-Chord Tone Resolution"
             else:
                 if random.random() < 0.7:
@@ -613,50 +767,91 @@ class HarmonizerApp:
     def _generate_violin(self, freq, duration, sample_rate):
         num_samples = int(duration * sample_rate)
         t = np.linspace(0, duration, num_samples, False)
-        vibrato_rate = 6.5; vibrato_depth = 0.015
-        lfo = np.sin(2 * np.pi * vibrato_rate * t)
-        freq_with_vibrato = freq * (2**(lfo * vibrato_depth / 12))
-        wave = np.zeros(num_samples)
-        num_harmonics = 15; inharmonicity_B = 0.0004 
-        for k in range(1, num_harmonics + 1):
-            base_partial_freq = k * freq * np.sqrt(1 + inharmonicity_B * k**2)
-            if base_partial_freq > sample_rate / 2: continue
-            partial_freq = k * freq_with_vibrato * np.sqrt(1 + inharmonicity_B * k**2)
-            amplitude = 1.0 / (k**1.2)
-            phase = 2 * np.pi * np.cumsum(partial_freq) / sample_rate
-            wave += amplitude * signal.sawtooth(phase)
-        b, a = signal.butter(2, 4000 / (0.5 * sample_rate), btype='low')
-        filtered_wave = signal.lfilter(b, a, wave)
-        attack_time = 0.07; release_time = 0.12
-        attack_samples = int(attack_time * sample_rate); release_samples = int(release_time * sample_rate)
+        
+        vibrato_rate = random.uniform(5.5, 6.5)
+        vibrato_depth = 0.012
+        phase_increment = (2 * np.pi * (freq/2) / sample_rate) * (1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t))
+        phase = np.cumsum(phase_increment)
+
+        saw_wave = signal.sawtooth(phase)
+        triangle_wave = signal.sawtooth(phase * 1.002, width=0.5) # Slight detune
+        bow_noise = np.random.normal(0, 0.03, num_samples)
+        wave = (saw_wave * 0.65) + (triangle_wave * 0.35) + bow_noise
+
+        formant_intensity = 1.0 + 0.1 * np.sin(2 * np.pi * 1.5 * t)
+        
+        formants = [ (550, 15), (2500, 10), (4000, 9) ]
+        body_filtered_wave = np.zeros_like(wave)
+        for res_freq, Q in formants:
+            b_res, a_res = signal.iirpeak(res_freq, Q, fs=sample_rate)
+            body_filtered_wave += signal.lfilter(b_res, a_res, wave * formant_intensity)
+        
+        if formants: body_filtered_wave /= len(formants)
+
+        b_lp, a_lp = signal.butter(2, 6000 / (0.5 * sample_rate), btype='low')
+        final_wave = signal.lfilter(b_lp, a_lp, body_filtered_wave)
+
+        attack_time = 0.08; release_time = 0.15
+        attack_samples = min(int(attack_time * sample_rate), num_samples//2)
+        release_samples = min(int(release_time * sample_rate), num_samples//2)
         sustain_samples = num_samples - attack_samples - release_samples
         if sustain_samples < 0:
             attack_samples = int(num_samples * (attack_time / (attack_time + release_time)))
             release_samples = num_samples - attack_samples
             sustain_samples = 0
-        env = np.concatenate([np.linspace(0, 1, attack_samples) if attack_samples > 0 else [], np.full(sustain_samples, 1.0) if sustain_samples > 0 else [], np.linspace(1, 0, release_samples) if release_samples > 0 else []])
-        return filtered_wave * env
+
+        env = np.concatenate([
+            np.linspace(0, 1, attack_samples)**1.5 if attack_samples > 0 else [], 
+            np.full(sustain_samples, 1.0) if sustain_samples > 0 else [], 
+            np.linspace(1, 0, release_samples)**2.5 if release_samples > 0 else []
+        ])
+        return final_wave * env
 
     def _generate_cello(self, freq, duration, sample_rate):
         num_samples = int(duration * sample_rate)
         t = np.linspace(0, duration, num_samples, False)
-        vibrato_rate = 5.5; vibrato_depth = 0.015
-        lfo = np.sin(2 * np.pi * vibrato_rate * t)
-        freq_with_vibrato = freq * (2**(lfo * vibrato_depth / 12))
-        wave = self._generate_rich_saw(freq_with_vibrato, duration, sample_rate, num_harmonics=12, detune_factor=0.015)
-        helmholtz_freq = 87.8
-        body_tone = 0.2 * np.sin(2 * np.pi * helmholtz_freq * t)
-        b, a = signal.butter(2, 2200 / (0.5 * sample_rate), btype='low')
-        filtered_wave = signal.lfilter(b, a, wave) + body_tone
-        attack_time = 0.12; release_time = 0.25
-        attack_samples = int(attack_time * sample_rate); release_samples = int(release_time * sample_rate)
+        base_freq = freq / 2
+        vibrato_rate = random.uniform(4.8, 5.5)
+        vibrato_depth = 0.009
+        phase_increment = (2 * np.pi * base_freq / sample_rate) * (1 + vibrato_depth * np.sin(2 * np.pi * vibrato_rate * t))
+        phase = np.cumsum(phase_increment)
+
+        saw_wave = signal.sawtooth(phase)
+        triangle_wave = signal.sawtooth(phase * 1.003, width=0.5) 
+        sine_wave = np.sin(phase)
+        bow_noise = np.random.normal(0, 0.025, num_samples) 
+        wave = (saw_wave * 0.5) + (triangle_wave * 0.4) + (sine_wave * 0.1) + bow_noise
+
+        formant_intensity_envelope = 1.0 + 0.05 * np.sin(2 * np.pi * 1.2 * t)
+        formants = [ (250, 9), (500, 11), (1500, 8), (3500, 7) ]
+        body_filtered_wave = np.zeros_like(wave)
+        wave_modulated = wave * formant_intensity_envelope
+        
+        for res_freq, Q in formants:
+            b_res, a_res = signal.iirpeak(res_freq, Q, fs=sample_rate)
+            body_filtered_wave += signal.lfilter(b_res, a_res, wave_modulated)
+        
+        if formants: body_filtered_wave /= len(formants)
+
+        b_lp, a_lp = signal.butter(2, 3800 / (0.5 * sample_rate), btype='low') 
+        final_wave = signal.lfilter(b_lp, a_lp, body_filtered_wave)
+
+        attack_time, release_time = 0.1, 0.3
+        attack_samples = min(int(attack_time * sample_rate), num_samples // 2)
+        release_samples = min(int(release_time * sample_rate), num_samples // 2)
         sustain_samples = num_samples - attack_samples - release_samples
+
         if sustain_samples < 0:
             attack_samples = int(num_samples * (attack_time / (attack_time + release_time)))
             release_samples = num_samples - attack_samples
             sustain_samples = 0
-        env = np.concatenate([np.linspace(0, 1, attack_samples) if attack_samples > 0 else [], np.full(sustain_samples, 1.0) if sustain_samples > 0 else [], np.linspace(1, 0, release_samples) if release_samples > 0 else []])
-        return filtered_wave * env
+            
+        env = np.concatenate([
+            np.linspace(0, 1, attack_samples)**1.3 if attack_samples > 0 else [], 
+            np.full(sustain_samples, 1.0) if sustain_samples > 0 else [], 
+            np.linspace(1, 0, release_samples)**2.2 if release_samples > 0 else []
+        ])
+        return final_wave * env
 
     def _generate_guitar(self, freq, duration, sample_rate):
         num_samples = int(duration * sample_rate)
@@ -735,20 +930,15 @@ class HarmonizerApp:
                 is_basic_waveform = True
             
             elif waveform_type == 'Piano':
-                # --- VOLUME IMPROVEMENT: Piano gain is now more controlled ---
-                piano_gain = 1.0 # Reduced from 23.0, normalization will handle loudness
+                piano_gain = 1.0 
                 num_partials = 16
-                
                 log_freq = np.log2(max(frequency, 20) / 20)
                 inharmonicity_B = 0.0001 + 0.0004 * (1 - np.sin(np.pi * log_freq / 10))
-                
                 decay_slow_base = 0.2 + (frequency / 2000.0) * 0.8 
                 decay_fast_base = 6.0 + (frequency / 2000.0) * 2.0
                 decay_freq_factor = 0.0005
-                
                 amp_fast_component = 0.6 + 0.3 * (log_freq / 10)
                 beating_factor = 1.0005 
-                
                 ref_freq_piano = 440.0
                 boost_factor = (max(ref_freq_piano, frequency) / ref_freq_piano)**0.25
                 piano_gain *= boost_factor
@@ -756,7 +946,6 @@ class HarmonizerApp:
                 for k in range(1, num_partials + 1):
                     partial_freq = k * frequency * np.sqrt(1 + inharmonicity_B * k**2)
                     if partial_freq > sample_rate / 2: continue
-
                     decay_fast = decay_fast_base + partial_freq * decay_freq_factor
                     decay_slow = decay_slow_base + partial_freq * decay_freq_factor * 0.5
                     env_fast = np.exp(-decay_fast * t); wave_fast = np.sin(2 * np.pi * partial_freq * t)
@@ -798,28 +987,13 @@ class HarmonizerApp:
                 is_basic_waveform = True
 
             if is_basic_waveform:
-                attack = 0.02
-                decay = 0.1
-                sustain = 0.7
-                release = 0.2
+                attack, decay, sustain, release = 0.02, 0.1, 0.7, 0.2
                 if release > duration_sec:
-                    release = duration_sec * 0.5
-                    attack = duration_sec * 0.1
-                    decay = duration_sec * 0.1
-
+                    release = duration_sec * 0.5; attack = duration_sec * 0.1; decay = duration_sec * 0.1
                 audio_data = self._apply_adsr_envelope(audio_data, attack, decay, sustain, release, sample_rate)
-            
-            # --- VOLUME IMPROVEMENT: This perceptual loudness factor is now applied AFTER normalization in the main generation thread ---
-            # This logic is moved to make volume more consistent before mixing.
-            # amplitude_factor = 1.0
-            # ref_freq = 440.0
-            # if waveform_type in ['Square', 'Sawtooth', 'Triangle', 'Rich Saw', 'Violin', 'Guitar']:
-            #     rolloff_exponent = 0.3
-            #     amplitude_factor = (ref_freq / max(ref_freq, frequency)) ** rolloff_exponent
             
             combined_audio += audio_data
 
-        # --- VOLUME IMPROVEMENT: We no longer divide by number of freqs here, as RMS normalization will handle chords correctly. ---
         return combined_audio if freqs else np.zeros(num_samples)
 
     def _generate_kick(self, duration_sec, sample_rate):
@@ -891,7 +1065,6 @@ class HarmonizerApp:
     def _get_rhythm_sequence(self, total_beats, tension=0.5, exclude_motif=None, persistent_motif=None):
         sequence, beats_generated = [], 0
         
-        # --- IMPROVEMENT: Use a persistent motif if provided to increase rhythmic coherence ---
         if persistent_motif:
             chosen_motif_name = persistent_motif
             self.update_log(f"  Rhythm Gen: Using persistent motif '{chosen_motif_name}'", 'debug', debug_only=True)
@@ -907,7 +1080,6 @@ class HarmonizerApp:
             chosen_motif_name = random.choice(motif_choices)
             self.update_log(f"  Rhythm Gen: Total beats={total_beats}, Tension={tension:.2f}, Chosen Motif={chosen_motif_name}", 'debug', debug_only=True)
 
-        # --- BUG FIX: Unified lookup logic to prevent KeyError ---
         if chosen_motif_name in self.POETIC_METERS:
             motif = self.POETIC_METERS[chosen_motif_name]
         else:
@@ -1093,20 +1265,19 @@ class HarmonizerApp:
             if ornament_type == 'arpeggio_run':
                 current_chord_indices = []
                 event_time_in_beats = event['start_time'] / beat_duration
-                chord_index = int(event_time_in_beats / (len(melody_events) / len(chord_progression_indices))) % len(chord_progression_indices)
+                chord_index = int(event_time_in_beats / (len(melody_events) / len(chord_progression_indices))) % len(chord_progression_indices) if chord_progression_indices else 0
                 if chord_progression_indices and chord_index < len(chord_progression_indices):
                     current_chord_indices = chord_progression_indices[chord_index]
 
                 if not current_chord_indices: continue
                 
                 self.update_log(f"  -> Adding arpeggio run at {event['start_time']:.2f}s", 'debug', debug_only=True)
-                ornamented_events.pop() # Remove original event
+                ornamented_events.pop() 
                 
-                arp_pattern = [0, 2, 4, 2] # Ascending arpeggio
+                arp_pattern = [0, 2, 4, 2] 
                 rhythm = self.ARPEGGIO_RHYTHMS[random.choice(list(self.ARPEGGIO_RHYTHMS.keys()))]
                 
                 time_cursor = event['start_time']
-                total_rhythm_beats = sum(r for r in rhythm if r > 0)
                 
                 for j, dur_factor in enumerate(rhythm):
                     note_dur = dur_factor * beat_duration
@@ -1131,7 +1302,6 @@ class HarmonizerApp:
                 grace_event.update({'start_time': event['start_time'] - 0.05, 'duration': 0.05, 'scale_idx': [main_note_idx - 1], 'freqs': [scale_notes[main_note_idx - 1]]})
                 ornamented_events.insert(-1, grace_event); ornament_times.append(grace_event['start_time'])
             
-            # ... (rest of the original ornamentation logic for mordent, turn)
             elif ornament_type == 'mordent' and 0 < main_note_idx < len(scale_notes) - 1:
                 ornament_dur = min(event['duration'] / 2, beat_duration / 4)
                 if event['duration'] > ornament_dur * 2:
@@ -1165,7 +1335,7 @@ class HarmonizerApp:
 
         style_weights = {'held': 0.8 - tension * 0.7, 'comping': tension * 0.8, 'arpeggiated': tension * 0.6}
         if song_affect == 'melancholy':
-            style_weights['arpeggiated'] *= 0.1 # Reduce chance of arpeggiation for melancholy affect
+            style_weights['arpeggiated'] *= 0.1
 
         total_weight = sum(style_weights.values())
         if total_weight <= 0: chosen_style = 'held'
@@ -1199,7 +1369,7 @@ class HarmonizerApp:
             rhythm_pattern = self.ARPEGGIO_RHYTHMS[random.choice(list(self.ARPEGGIO_RHYTHMS.keys()))]
             time_cursor = start_time
             arp_notes = [scale_notes[idx] for idx in chord_indices_voic_led]
-            arp_pattern_indices = [0, 1, 2, 1] # Up-down pattern
+            arp_pattern_indices = [0, 1, 2, 1] 
             
             beat_num = 0
             while time_cursor < start_time + duration:
@@ -1222,7 +1392,7 @@ class HarmonizerApp:
 
         style_weights = {'held': 0.2 - tension * 0.2, 'arpeggiated': tension * 0.8, 'walking': tension * 1.5, 'rhythmic': tension * 0.5}
         if song_affect == 'melancholy':
-            style_weights['arpeggiated'] *= 0.1 # Reduce chance of arpeggiation for melancholy affect
+            style_weights['arpeggiated'] *= 0.1 
             style_weights['walking'] *= 0.5
 
         total_weight = sum(style_weights.values())
@@ -1364,27 +1534,62 @@ class HarmonizerApp:
         return new_progression
 
     def _get_chord_indices_from_roman(self, roman_numeral, scale_type, key_root_note):
+        # This is the new, rewritten function
+        diatonic_chords_for_scale = self.DIATONIC_CHORDS.get(scale_type, {})
+        
+        # Handle secondary dominants/leading tones (e.g., "V7/V", "vii°7/ii")
         if "/" in roman_numeral:
-            dominant_part, target_roman = roman_numeral.split("/")
-            
-            target_degree = self.ROMAN_TO_DEGREE.get(target_roman.lower(), 0)
-            scale_intervals = self.INTERVAL_NAMES.get(scale_type, self.MAJOR_INTERVALS)
-            target_root_semitone = scale_intervals[target_degree]
-            
-            if "V" in dominant_part:
-                secondary_dominant_root_semitone = (target_root_semitone + 7) % 12
-                chord_intervals = self.CHORD_QUALITIES['dom7']
-            else:
-                secondary_dominant_root_semitone = (target_root_semitone - 1) % 12
-                chord_intervals = self.DIMINISHED_7_INTERVALS
+            try:
+                secondary_chord_part, target_roman = roman_numeral.split('/', 1)
+                
+                target_degree = self.ROMAN_TO_DEGREE.get(target_roman.lower())
+                if target_degree is None: return []
 
-            return self.DIATONIC_CHORDS.get(scale_type, {}).get('V', [])
+                primary_scale_intervals = self.INTERVAL_NAMES.get(scale_type, self.MAJOR_INTERVALS)
+                if target_degree >= len(primary_scale_intervals): return []
+
+                target_root_semitone_offset = primary_scale_intervals[target_degree]
+                
+                quality_intervals = []
+                if "V" in secondary_chord_part:
+                    quality_intervals = self.CHORD_QUALITIES['dom7'] if '7' in secondary_chord_part else self.CHORD_QUALITIES['maj']
+                elif "vii" in secondary_chord_part:
+                    quality_intervals = self.CHORD_QUALITIES['half-dim7'] if '7' in secondary_chord_part else self.CHORD_QUALITIES['dim']
+                else:
+                    return []
+
+                chord_semitones = [(target_root_semitone_offset + interval) % 12 for interval in quality_intervals]
+
+                chord_indices = []
+                for semitone in chord_semitones:
+                    closest_degree, min_dist = -1, float('inf')
+                    for i, scale_interval in enumerate(primary_scale_intervals):
+                        dist = min(abs(semitone - scale_interval), 12 - abs(semitone - scale_interval))
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_degree = i
+                    if closest_degree != -1:
+                        chord_indices.append(closest_degree)
+
+                return sorted(list(set(chord_indices)))
+
+            except Exception as e:
+                self.update_log(f"Error parsing secondary chord '{roman_numeral}': {e}", 'debug', debug_only=True)
+                return []
 
         else:
-            cleaned_roman = roman_numeral.replace('°', '').replace('+', '')
-            return self.DIATONIC_CHORDS.get(scale_type, {}).get(cleaned_roman, [])
+            if roman_numeral in diatonic_chords_for_scale:
+                return diatonic_chords_for_scale[roman_numeral]
+            
+            cleaned_roman = roman_numeral.replace('°', '').replace('+', '').replace('7', '')
+            for chord, indices in diatonic_chords_for_scale.items():
+                if chord.replace('°', '').replace('+', '').replace('7', '') == cleaned_roman:
+                    return indices
 
-    def _generate_song_section_data(self, selected_scale_name, selected_scale_notes, scale_type, progression_name, section_duration, melody_bpm, log_callback, scale_notes_base, texture_mode, song_affect, tension=0.5, is_heterophonic=False, is_reprise=False, is_polyrhythmic=False, is_polytonal=False, section_profile={}):
+            self.update_log(f"Warning: Could not find chord '{roman_numeral}' in {scale_type}. Using tonic.", 'debug', debug_only=True)
+            return diatonic_chords_for_scale.get('I', diatonic_chords_for_scale.get('i', []))
+
+    def _generate_song_section_data(self, selected_scale_name, selected_scale_notes, scale_type, progression_name, section_duration, melody_bpm, log_callback, scale_notes_base, texture_mode, song_affect, tension=0.5, is_heterophonic=False, is_reprise=False, is_polyrhythmic=False, is_polytonal=False, section_profile={}, urlinie_segment=None, pitch_class_set=None):
         log_callback(f"Generating section data for '{progression_name}' with affect '{song_affect}'", 'debug', debug_only=True)
         progression_romans_base = self.CHORD_PROGRESSIONS.get(scale_type, {}).get(progression_name, [])
         if not progression_romans_base:
@@ -1403,14 +1608,18 @@ class HarmonizerApp:
 
         melody1_events, melody2_events, bass_events, chord_events = [], [], [], []
         base_scale_len = len(scale_notes_base)
-        structural_melody_guide = self._generate_structural_melody(chord_progression_indices_base, base_scale_len)
+        
+        if urlinie_segment is None:
+            structural_melody_guide = self._generate_structural_melody(chord_progression_indices_base, base_scale_len)
+        else:
+            structural_melody_guide = urlinie_segment
+
         characteristic_note_idx = self.MODAL_CHARACTERISTICS.get(scale_type)
         initial_chord_note_m1 = chord_progression_indices_base[0][0] if chord_progression_indices_base and chord_progression_indices_base[0] else 0
         m1_current_idx = m1_last_idx = initial_chord_note_m1 + base_scale_len * 2
         m2_current_idx = m2_last_idx = m1_last_idx - base_scale_len
         beat_duration = 60.0 / melody_bpm
         chord_duration = section_duration / len(chord_progression_indices_base) if chord_progression_indices_base else section_duration
-        dissonance_level = 0.05 + (tension * 0.4)
         current_time, last_chord_indices_voic_led = 0.0, []
 
         m1_vol_mult = section_profile.get('m1_vol', 1.0)
@@ -1425,34 +1634,22 @@ class HarmonizerApp:
             polytonal_scale_notes = [f/2 for f in polytonal_scale_base] + polytonal_scale_base + [f*2 for f in polytonal_scale_base] + [f*4 for f in polytonal_scale_base]
             log_callback(f"Melody 2 uses polytonal key: {related_key}", 'debug', debug_only=True)
         
-        # --- IMPROVEMENT: A single rhythmic motif is now chosen for the whole section for better coherence ---
-        _, section_rhythmic_motif = self._get_rhythm_sequence(16, tension=tension) # Generate a representative motif
+        _, section_rhythmic_motif = self._get_rhythm_sequence(16, tension=tension)
 
         for i, chord_indices in enumerate(chord_progression_indices_base):
-            if not chord_indices: continue
+            if not chord_indices:
+                self.update_log(f"Skipping unresolved chord '{progression_romans[i]}'", "debug", debug_only=True)
+                current_time += chord_duration
+                continue
+
             log_callback(f"  Processing chord {i+1}/{len(chord_progression_indices_base)}: {progression_romans[i]}", 'debug', debug_only=True)
             chord_indices_voic_led = self._apply_voice_leading(last_chord_indices_voic_led, chord_indices, base_scale_len)
             last_chord_indices_voic_led = chord_indices_voic_led
-            target_structural_note = structural_melody_guide[i]
+            target_structural_note = structural_melody_guide[i] if i < len(structural_melody_guide) else None
             num_chord_beats = int(round(chord_duration / beat_duration))
             time_m1, m1_events_this_chord = current_time, []
             
-            if m1_vol_mult > 0 and progression_name in ['development', 'bridge'] and random.random() < 0.3:
-                schema_name = random.choice(list(self.CLASSICAL_SCHEMAS.keys()))
-                schema_events, schema_duration_sec = self._apply_schema(m1_current_idx, schema_name, selected_scale_notes, beat_duration)
-                
-                for event in schema_events:
-                    event['start_time'] = time_m1
-                    event['articulation'] = 1.0
-                    event['volume'] = (0.6 + tension * 0.4) * m1_vol_mult
-                    event['waveform'] = self.current_m1_waveform
-                    m1_events_this_chord.append(event)
-                    time_m1 += event['duration']
-                
-                if m1_events_this_chord and 'scale_idx' in m1_events_this_chord[-1]:
-                    m1_current_idx = m1_events_this_chord[-1]['scale_idx'][0]
-
-            if m1_vol_mult > 0 and not m1_events_this_chord and (texture_mode != 'monophonic_breakdown' or random.random() < 0.5):
+            if m1_vol_mult > 0:
                 rhythm_phrases_m1, _ = self._get_rhythm_sequence(num_chord_beats, tension=tension * (1.2 if is_reprise else 1.0), persistent_motif=section_rhythmic_motif)
                 beats_elapsed = 0
                 for phrase in rhythm_phrases_m1:
@@ -1462,8 +1659,8 @@ class HarmonizerApp:
                         if time_m1 >= current_time + chord_duration: continue
                         if beat > 0:
                             phrase_progress = beats_elapsed / sum(abs(b) for p in rhythm_phrases_m1 for b in p) if sum(abs(b) for p in rhythm_phrases_m1 for b in p) > 0 else 0
-                            m1_new_idx, _, _ = self._generate_melodic_note(m1_current_idx, m1_last_idx, None, selected_scale_notes, chord_indices, 0, 0, progression_name, scale_type, log_callback, contour, phrase_progress, target_note_idx=target_structural_note, is_strong_beat=(beats_elapsed % 1 == 0), characteristic_note_idx=characteristic_note_idx)
-                            m1_figure = self._build_harmony_figure(m1_new_idx, len(selected_scale_notes), base_scale_len, dissonance_level, chord_indices)
+                            m1_new_idx, _, _ = self._generate_melodic_note(m1_current_idx, m1_last_idx, None, selected_scale_notes, chord_indices, 0, 0, progression_name, scale_type, log_callback, contour, phrase_progress, target_note_idx=target_structural_note, is_strong_beat=(beats_elapsed % 1 == 0), characteristic_note_idx=characteristic_note_idx, pitch_class_set=pitch_class_set)
+                            m1_figure = self._build_harmony_figure(m1_new_idx, len(selected_scale_notes), base_scale_len, 0.1, chord_indices)
                             volume = (0.6 + tension * 0.4) * m1_vol_mult
                             m1_events_this_chord.append({'start_time': time_m1, 'duration': duration, 'freqs': [selected_scale_notes[i] for i in m1_figure], 'scale_idx': m1_figure, 'articulation': 1.0, 'volume': volume, 'waveform': self.current_m1_waveform})
                             m1_current_idx = m1_new_idx
@@ -1473,7 +1670,10 @@ class HarmonizerApp:
             melody1_events.extend(m1_events_this_chord)
             
             if m2_vol_mult > 0:
-                if is_heterophonic:
+                if texture_mode == 'counterpoint':
+                    counterpoint_engine = SpeciesCounterpointEngine(m1_events_this_chord, selected_scale_notes, base_scale_len)
+                    melody2_events.extend(counterpoint_engine.generate_first_species(m2_current_idx, self.current_m2_waveform, m2_vol_mult))
+                elif is_heterophonic:
                     for event in m1_events_this_chord:
                         if 'scale_idx' not in event or not event['scale_idx']: continue
                         new_event = copy.deepcopy(event)
@@ -1482,26 +1682,6 @@ class HarmonizerApp:
                         if is_polytonal:
                             closest_poly_freq = min(polytonal_scale_notes, key=lambda f: abs(f - selected_scale_notes[new_event['scale_idx'][0]])); new_event['scale_idx'] = [polytonal_scale_notes.index(closest_poly_freq)]; new_event['freqs'] = [closest_poly_freq]
                         new_event['volume'] *= (0.7 * m2_vol_mult); new_event['waveform'] = self.current_m2_waveform; melody2_events.append(new_event)
-                elif texture_mode == 'polyphonic':
-                    time_m2 = current_time
-                    rhythm_phrases_m2, _ = self._get_rhythm_sequence(num_chord_beats, tension=tension*0.8, exclude_motif=section_rhythmic_motif if is_polyrhythmic else None)
-                    polytonal_chord_indices = self._map_chord_to_polytonal_scale(chord_indices, selected_scale_notes, polytonal_scale_notes) if is_polytonal else chord_indices
-                    for phrase in rhythm_phrases_m2:
-                        for beat in phrase:
-                            duration = abs(beat) * beat_duration
-                            if time_m2 >= current_time + chord_duration: continue
-                            response_action = 'none'
-                            if m1_ornament_times and time_m2 >= m1_ornament_times[-1] and (time_m2 - m1_ornament_times[-1]) < beat_duration * 2:
-                                response_action = random.choice(['hocket', 'rhythmic_ack']); m1_ornament_times.pop()
-                                log_callback(f"Melody2 responding with: {response_action}", 'debug', debug_only=True)
-                            if beat > 0 and response_action != 'hocket':
-                                m2_new_idx, _, _ = self._generate_melodic_note(m2_current_idx, m2_last_idx, None, polytonal_scale_notes, polytonal_chord_indices, 0, 0, progression_name, scale_type, log_callback, 'arch', 0.5)
-                                m2_figure = self._build_harmony_figure(m2_new_idx, len(polytonal_scale_notes), base_scale_len, dissonance_level, polytonal_chord_indices)
-                                event_volume, event_duration = (0.5 + tension * 0.4) * m2_vol_mult, duration
-                                if response_action == 'rhythmic_ack': event_volume *= 1.2; event_duration *= 0.5
-                                melody2_events.append({'start_time': time_m2, 'duration': event_duration, 'freqs': [polytonal_scale_notes[i] for i in m2_figure], 'scale_idx': m2_figure, 'articulation': 1.0, 'volume': event_volume, 'waveform': self.current_m2_waveform})
-                                m2_current_idx = m2_new_idx
-                            time_m2 += duration
             
             next_chord_indices = None
             if i + 1 < len(chord_progression_indices_base):
@@ -1517,7 +1697,7 @@ class HarmonizerApp:
                     melody_events=m1_events_this_chord, song_affect=song_affect, volume_multiplier=bass_vol_mult
                 ))
             
-            if chords_vol_mult > 0:
+            if chords_vol_mult > 0 and pitch_class_set is None:
                 chord_events.extend(self._generate_rhythmic_chord_events(
                     start_time=current_time, duration=chord_duration,
                     chord_indices_voic_led=chord_indices_voic_led, scale_notes=selected_scale_notes,
@@ -1608,7 +1788,6 @@ class HarmonizerApp:
         self.update_log(f"Applying {duration_s}s fade out.", 'debug', debug_only=True)
         fade_samples = int(duration_s * sample_rate)
         if len(audio) > fade_samples:
-            # Create a fade-out curve that can be broadcast to stereo
             fade_curve = np.linspace(1.0, 0.0, fade_samples)[:, np.newaxis]
             audio[-fade_samples:] *= fade_curve
         return audio
@@ -1636,6 +1815,7 @@ class HarmonizerApp:
         if affect == 'uplifting': m1_choice = random.choice(["Piano", "Violin", "Rich Saw", "Guitar"])
         elif affect == 'melancholy': m1_choice = random.choice(["Cello", "Hollow Square", "Piano", "Guitar"])
         elif affect == 'serene': m1_choice = random.choice(["Violin", "Sine", "Hollow Square", "Guitar"])
+        elif affect == 'atonal': m1_choice = random.choice(["Vibraphone", "Glockenspiel", "Piano"])
         else: m1_choice = random.choice(["Rich Saw", "Violin", "Cello", "Guitar"])
         self.melody1_waveform_var.set(m1_choice)
         if m1_choice == "Piano": self.melody2_waveform_var.set(random.choice(["Sine", "Hollow Square", "Cello"]))
@@ -1721,16 +1901,16 @@ class HarmonizerApp:
         self.last_bit_depth = int(self.bit_depth_var.get()) if self.ui_mode else int(self.settings.get("bit_depth", 24))
         self.last_sample_rate = 44100; self._generate_thematic_seed()
         
-        # --- NEW: Use Tension slider value ---
         global_tension = self.tension_slider.get() / 100.0 if self.ui_mode else 0.5
 
-        song_affect = random.choice(['uplifting', 'melancholy', 'serene', 'intense'])
+        song_affect = random.choice(['uplifting', 'melancholy', 'serene', 'intense', 'atonal'])
         if song_affect == 'uplifting': melody_bpm, affect_scale_choices = random.randint(120, 160), ["Major", "Pentatonic Major", "Lydian", "Mixolydian"]
         elif song_affect == 'melancholy': melody_bpm, affect_scale_choices = random.randint(70, 110), ["Minor", "Harmonic Minor", "Dorian"]
         elif song_affect == 'serene': melody_bpm, affect_scale_choices = random.randint(60, 90), ["Custom", "Pentatonic Major", "Lydian"]
+        elif song_affect == 'atonal': melody_bpm, affect_scale_choices = random.randint(80, 120), ["Major"] # Use Major as a base for 12-tone mapping
         else: melody_bpm, affect_scale_choices = random.randint(130, 180), ["Phrygian Dominant", "Blues", "Melodic Minor", "Phrygian", "Locrian"]
         
-        melody_bpm += (global_tension - 0.5) * 40 # Tension affects tempo
+        melody_bpm += (global_tension - 0.5) * 40 
         
         beat_duration, log_callback = 60.0 / melody_bpm, self.update_log
         
@@ -1739,13 +1919,19 @@ class HarmonizerApp:
             self.update_log("No scales selected, choosing from all available scales.", 'main')
             user_enabled_scales = self.scale_types
 
-        final_scale_choices = [s for s in user_enabled_scales if s in affect_scale_choices] or user_enabled_scales
-        possible_scales = [name for name in self.MUSICAL_SCALES.keys() if name.split(' ', 1)[1] in final_scale_choices]
-        selected_scale_name = random.choice(possible_scales) if possible_scales else "C Major"
+        pitch_class_set = None
+        if song_affect == 'atonal':
+            pitch_class_set = random.choice(self.AFFECT_PITCH_SETS['atonal']['source_sets'])
+            log_callback(f"Atonal Mode: Using Pitch-Class Set {pitch_class_set}", 'main')
+            selected_scale_name = "C Major" # Base for chromatic mapping
+        else:
+            final_scale_choices = [s for s in user_enabled_scales if s in affect_scale_choices] or user_enabled_scales
+            possible_scales = [name for name in self.MUSICAL_SCALES.keys() if name.split(' ', 1)[1] in final_scale_choices]
+            selected_scale_name = random.choice(possible_scales) if possible_scales else "C Major"
         
         if self.ui_mode and self.auto_wave_var.get(): self._intelligently_select_waveforms(song_affect)
         
-        texture_type = random.choices(['homophonic', 'polyphonic', 'heterophonic'], weights=[3, 3, 3])[0]
+        texture_type = random.choices(['homophonic', 'polyphonic', 'heterophonic', 'counterpoint'], weights=[2, 2, 2, 2])[0]
         is_polyphonic, is_heterophonic = (texture_type == 'polyphonic'), (texture_type == 'heterophonic')
         is_polyrhythmic, is_polytonal = (texture_type != 'homophonic') and random.random() < 0.5, (texture_type != 'homophonic') and random.random() < 0.4
         log_callback(f"Generating {total_duration}s of music...", 'main')
@@ -1780,7 +1966,8 @@ class HarmonizerApp:
         SECTION_PROFILES['recap_b'] = SECTION_PROFILES['chorus']
 
         structure, section_map = [], {}
-        if song_form == "Ternary": structure = ['A', 'B', 'A_reprise']
+        if song_form == "Theme and Variations": structure = ['verse'] + [f'verse_var_{i+1}' for i in range(4)]
+        elif song_form == "Ternary": structure = ['A', 'B', 'A_reprise']
         elif song_form == "Rondo": structure = ['A', 'B', 'A_reprise', 'C', 'A_reprise']
         elif song_form == "AABA": structure = ['A', 'A_reprise', 'B', 'A_reprise']
         elif song_form == "Sonata":
@@ -1789,10 +1976,15 @@ class HarmonizerApp:
             section_map = {'Exposition_A': {'prog': 'verse', 'key': selected_scale_name}, 'Exposition_B': {'prog': 'chorus', 'key': dominant_key}, 'Development': {'prog': 'development', 'key': selected_scale_name}, 'Recap_A': {'prog': 'verse', 'key': selected_scale_name}, 'Recap_B': {'prog': 'chorus', 'key': selected_scale_name}}
         else: structure = ['intro', 'verse', 'chorus', 'verse', 'chorus', 'bridge', 'chorus'] if total_duration > 60 else ['chorus', 'verse', 'chorus'] if total_duration >= 45 else ['chorus', 'verse']
         if total_duration > 60 and 'outro' not in structure: structure.append('outro')
+        
         log_callback(f"Song Structure: {structure}", 'debug', debug_only=True)
         tension_map = {'intro':0.2, 'verse':0.4, 'pre-chorus':0.6, 'chorus':0.9, 'bridge':0.5, 'solo':1.0, 'development':0.8, 'outro':0.3, 'a':0.4, 'b':0.6, 'c':0.8, 'exposition_a':0.4, 'exposition_b':0.7, 'recap_a':0.5, 'recap_b':0.8}
+        
+        schenker_urlinie = self._generate_urlinie(len(structure), len(self.MUSICAL_SCALES[selected_scale_name]))
+
         section_data_cache, section_duration = {}, total_duration / len(structure)
         full_song_data, full_drum_data, current_time, section_log_timeline = {'melody1': [], 'melody2': [], 'bass': [], 'chords': []}, [], 0.0, []
+        
         for i, section_name in enumerate(structure):
             progression_name = section_name.split('_')[0].lower()
             if progression_name == 'a': progression_name = 'verse'
@@ -1801,10 +1993,8 @@ class HarmonizerApp:
             elif progression_name.startswith(('exposition', 'recap')): progression_name = section_map[section_name]['prog']
             
             base_tension = tension_map.get(progression_name, 0.5)
-            section_tension = base_tension + (global_tension - 0.5) * 0.5 # Apply global tension
+            section_tension = base_tension + (global_tension - 0.5) * 0.5 
             
-            texture_mode = 'polyphonic' if is_polyphonic or is_heterophonic else 'homophonic'
-            if section_tension < 0.3 and random.random() < 0.3: texture_mode = 'monophonic_breakdown'
             log_callback(f"--- Generating {section_name.title()} (as {progression_name}) ---", 'main')
             section_log_timeline.append({'start_time': current_time, 'log_type': 'main', 'message': f"--- Playing {section_name.title()} ---"})
             original_section_name = section_name.split('_')[0]
@@ -1817,6 +2007,8 @@ class HarmonizerApp:
             current_scale_notes = [f/2 for f in current_scale_notes_base] + current_scale_notes_base + [f*2 for f in current_scale_notes_base] + [f*4 for f in current_scale_notes_base]
             if current_key != selected_scale_name: log_callback(f"Modulating to key: {current_key}", 'main')
 
+            urlinie_segment = [schenker_urlinie[i]] * len(self.CHORD_PROGRESSIONS.get(current_key.split(' ')[1], {}).get(progression_name, [1,1,1,1]))
+
             if 'outro' in section_name:
                 section_data = self._generate_outro_section_data(current_key, current_scale_notes, current_key.split(' ', 1)[1], section_duration, melody_bpm, log_callback, current_scale_notes_base, song_affect)
                 drum_data = []
@@ -1824,9 +2016,9 @@ class HarmonizerApp:
                 log_callback(f"Using cached data for reprise of '{original_section_name}'", 'debug', debug_only=True)
                 section_data, drum_data = copy.deepcopy(section_data_cache[original_section_name]['section']), copy.deepcopy(section_data_cache[original_section_name]['drums'])
             else:
-                section_data = self._generate_song_section_data(current_key, current_scale_notes, current_key.split(' ', 1)[1], progression_name, section_duration, melody_bpm, log_callback, current_scale_notes_base, texture_mode, song_affect, tension=section_tension, is_heterophonic=is_heterophonic, is_reprise=('_reprise' in section_name), is_polyrhythmic=is_polyrhythmic, is_polytonal=is_polytonal, section_profile=section_profile)
+                section_data = self._generate_song_section_data(current_key, current_scale_notes, current_key.split(' ', 1)[1], progression_name, section_duration, melody_bpm, log_callback, current_scale_notes_base, texture_type, song_affect, tension=section_tension, is_heterophonic=is_heterophonic, is_reprise=('_reprise' in section_name), is_polyrhythmic=is_polyrhythmic, is_polytonal=is_polytonal, section_profile=section_profile, urlinie_segment=urlinie_segment, pitch_class_set=pitch_class_set)
                 
-                if section_profile.get('drums', True):
+                if section_profile.get('drums', True) and song_affect != 'atonal':
                     drum_data = self._generate_dynamic_drum_rhythm(progression_name, section_duration, melody_bpm, drum_style, section_tension)
                 else:
                     drum_data = []
@@ -1909,23 +2101,17 @@ class HarmonizerApp:
         self.update_log("Finished generating all song data.", 'debug', debug_only=True)
         return full_song_data, full_drum_data, section_log_timeline, 'fade_out', current_time, melody_bpm
     
-    # +++ VOLUME IMPROVEMENT: New function to normalize audio segments +++
     def _normalize_segment(self, segment, target_rms=0.1):
-        """
-        Normalizes a single audio segment to a target RMS level.
-        This ensures that different instruments and notes have a consistent perceived loudness.
-        """
         if segment.size == 0:
             return segment
         
         current_rms = np.sqrt(np.mean(segment**2))
-        if current_rms < 1e-6:  # Avoid division by zero for silence
+        if current_rms < 1e-6: 
             return segment
         
         gain = target_rms / current_rms
         normalized_segment = segment * gain
         
-        # Apply a peak limiter to prevent clipping after normalization
         peak = np.max(np.abs(normalized_segment))
         if peak > 0.99:
             normalized_segment /= peak
@@ -1944,12 +2130,10 @@ class HarmonizerApp:
             total_samples = int(total_duration * SAMPLE_RATE) + int(SAMPLE_RATE * 5)
             self.update_log(f"Allocating audio buffers for {total_duration:.2f}s ({total_samples} samples)", 'debug', debug_only=True)
             
-            # --- NEW: Tracks are now stereo from the start ---
             part_tracks = {part: np.zeros((total_samples, 2), dtype=np.float64) for part in full_song_data.keys()}
             drum_track = np.zeros((total_samples, 2), dtype=np.float64)
             fade_samples = int(0.005 * SAMPLE_RATE)
             
-            # --- NEW: Get panning values ---
             pan_values = {
                 'melody1': self.m1_pan_slider.get() / 100.0,
                 'melody2': self.m2_pan_slider.get() / 100.0,
@@ -1962,7 +2146,6 @@ class HarmonizerApp:
                 track = part_tracks[part_name]
                 for item in events:
                     effective_duration = item['duration']
-                    # --- NEW: Enforce minimum duration for resonant instruments ---
                     if item['waveform'] in self.RESONANT_WAVEFORMS and item['duration'] < self.MIN_RESONANT_DURATION:
                         effective_duration = self.MIN_RESONANT_DURATION
                     
@@ -1976,7 +2159,6 @@ class HarmonizerApp:
 
                     final_segment = self._apply_hybrid_envelope(normalized_segment * amplitude_factor, fade_samples)
 
-                    # --- NEW: Apply panning ---
                     pan = pan_values.get(part_name, 0.0)
                     left_gain = math.sqrt(0.5 * (1 - pan))
                     right_gain = math.sqrt(0.5 * (1 + pan))
@@ -1990,9 +2172,8 @@ class HarmonizerApp:
             for item in full_drum_data:
                 raw_segment = self._generate_percussion_sound(item['drum_type'], item['duration'], SAMPLE_RATE)
                 if raw_segment.size == 0: continue
-                normalized_segment = self._normalize_segment(raw_segment, target_rms=0.15) # Drums are a bit louder
+                normalized_segment = self._normalize_segment(raw_segment, target_rms=0.15)
                 
-                # Drums are kept in the center
                 stereo_segment = np.column_stack((normalized_segment, normalized_segment))
 
                 start_s, end_s = int(item['start_time'] * SAMPLE_RATE), int(item['start_time'] * SAMPLE_RATE) + len(stereo_segment)
@@ -2150,7 +2331,6 @@ class HarmonizerApp:
             if self.last_bit_depth == 24:
                 audio_data_int = (audio_to_save * (2**23 - 1)).astype(np.int32)
                 byte_data = bytearray()
-                # Interleave stereo channels for 24-bit
                 for l_sample, r_sample in audio_data_int:
                     byte_data.extend(l_sample.to_bytes(4, byteorder='little', signed=True)[:3])
                     byte_data.extend(r_sample.to_bytes(4, byteorder='little', signed=True)[:3])
@@ -2179,7 +2359,6 @@ class HarmonizerApp:
             beat_dur = 60.0 / self.last_melody_bpm
             midi.addTempo(0, 0, self.last_melody_bpm)
 
-            # --- NEW: Use selected MIDI instruments from UI ---
             track_map = {
                 'melody1': {'track': 1, 'channel': 0, 'program': self.MIDI_INSTRUMENTS[self.midi_m1_var.get()]},
                 'melody2': {'track': 2, 'channel': 1, 'program': self.MIDI_INSTRUMENTS[self.midi_m2_var.get()]},
